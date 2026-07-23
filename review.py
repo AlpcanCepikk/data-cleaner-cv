@@ -180,11 +180,13 @@ CANONICAL_COLUMNS = [
 
 
 def detect_label_format(labels_path):
-    """Return one of: 'csv', 'coco', 'yolo', 'voc', 'unknown'."""
+    """Return one of: 'csv', 'xlsx', 'coco', 'yolo', 'voc', 'unknown'."""
     if os.path.isfile(labels_path):
         ext = os.path.splitext(labels_path)[1].lower()
         if ext == ".csv":
             return "csv"
+        if ext in (".xlsx", ".xls"):
+            return "xlsx"
         if ext == ".json":
             return "coco"
         if ext in (".xml",):
@@ -409,6 +411,12 @@ def load_labels(labels_path, images_dir):
     print("[Loader] Detected format: " + fmt)
     if fmt == "csv":
         return load_csv(labels_path), fmt
+    if fmt == "xlsx":
+        try:
+            return pd.read_excel(labels_path), fmt
+        except ImportError:
+            print("ERROR: reading .xlsx needs `openpyxl`. Run: pip install openpyxl")
+            sys.exit(1)
     if fmt == "yolo":
         return load_yolo(labels_path, images_dir), fmt
     if fmt == "coco":
@@ -443,6 +451,140 @@ def _prompt(prompt_text, default=None):
     suffix = (" [" + default + "]") if default else ""
     val = input(prompt_text + suffix + ": ").strip()
     return val or default
+
+
+def _scan_workspace(folder):
+    """Scan a folder for image-dir candidates and label-source candidates.
+    Returns (image_candidates, label_candidates) — each a list of (label, path)."""
+    image_cands = []
+    label_cands = []
+    if not os.path.isdir(folder):
+        return image_cands, label_cands
+
+    # image candidates: subfolders containing images, or root itself if it has images
+    def _count_images(p):
+        if not os.path.isdir(p):
+            return 0
+        try:
+            return sum(1 for f in os.listdir(p)
+                       if f.lower().endswith(SUPPORTED_IMG_EXTS))
+        except OSError:
+            return 0
+
+    root_imgs = _count_images(folder)
+    if root_imgs > 0:
+        image_cands.append((f"./ ({root_imgs} images)", folder))
+    for name in sorted(os.listdir(folder)):
+        sub = os.path.join(folder, name)
+        if not os.path.isdir(sub) or name.startswith("_"):
+            continue
+        n = _count_images(sub)
+        if n > 0:
+            image_cands.append((f"{name}/ ({n} images)", sub))
+
+    # label candidates: csv/xlsx/json files in root + folders with .txt or .xml
+    for name in sorted(os.listdir(folder)):
+        full = os.path.join(folder, name)
+        low = name.lower()
+        if os.path.isfile(full):
+            if low.endswith(".csv"):
+                try:
+                    n = sum(1 for _ in open(full, encoding="utf-8", errors="ignore")) - 1
+                except OSError:
+                    n = "?"
+                label_cands.append((f"{name}  (CSV, ~{n} rows)", full))
+            elif low.endswith((".xlsx", ".xls")):
+                label_cands.append((f"{name}  (Excel)", full))
+            elif low.endswith(".json"):
+                label_cands.append((f"{name}  (COCO JSON)", full))
+        elif os.path.isdir(full) and not name.startswith("_"):
+            try:
+                entries = os.listdir(full)
+            except OSError:
+                continue
+            n_txt = sum(1 for e in entries if e.lower().endswith(".txt"))
+            n_xml = sum(1 for e in entries if e.lower().endswith(".xml"))
+            if n_xml > 0:
+                label_cands.append((f"{name}/  (VOC, {n_xml} xml)", full))
+            elif n_txt > 0:
+                label_cands.append((f"{name}/  (YOLO, {n_txt} txt)", full))
+    return image_cands, label_cands
+
+
+def _tk_pick_workspace():
+    """Tk-based startup picker. Returns (images, labels, workspace) or None on
+    cancel. Falls back gracefully if tkinter is unavailable."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog, messagebox
+    except ImportError:
+        return None
+
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        folder = filedialog.askdirectory(title="Workspace klasörünü seç (görseller + labels burada olmalı)")
+        if not folder:
+            root.destroy()
+            return None
+        folder = os.path.abspath(folder)
+
+        img_cands, lbl_cands = _scan_workspace(folder)
+        if not img_cands:
+            messagebox.showerror("data-cleaner-cv",
+                                 f"Klasörde görsel bulunamadı:\n{folder}")
+            root.destroy()
+            return None
+        if not lbl_cands:
+            messagebox.showerror("data-cleaner-cv",
+                                 f"Klasörde label dosyası bulunamadı (CSV, XLSX, COCO JSON, YOLO/VOC folder):\n{folder}")
+            root.destroy()
+            return None
+
+        # If exactly one of each, return immediately
+        if len(img_cands) == 1 and len(lbl_cands) == 1:
+            root.destroy()
+            return img_cands[0][1], lbl_cands[0][1], folder
+
+        # Otherwise show selection window
+        sel = tk.Toplevel(root)
+        sel.title("Workspace seçimi")
+        sel.geometry("560x420")
+        tk.Label(sel, text=f"Klasör: {folder}", anchor="w").pack(fill="x", padx=10, pady=(10, 4))
+
+        tk.Label(sel, text="Görsel klasörü:", anchor="w", font=("", 10, "bold")).pack(fill="x", padx=10, pady=(8, 2))
+        img_var = tk.StringVar(value=img_cands[0][1])
+        for label, path in img_cands:
+            tk.Radiobutton(sel, text=label, variable=img_var, value=path, anchor="w").pack(fill="x", padx=20)
+
+        tk.Label(sel, text="Labels:", anchor="w", font=("", 10, "bold")).pack(fill="x", padx=10, pady=(10, 2))
+        lbl_var = tk.StringVar(value=lbl_cands[0][1])
+        for label, path in lbl_cands:
+            tk.Radiobutton(sel, text=label, variable=lbl_var, value=path, anchor="w").pack(fill="x", padx=20)
+
+        result = {"ok": False}
+        def _confirm():
+            result["ok"] = True
+            sel.destroy()
+        def _cancel():
+            sel.destroy()
+        btn_frame = tk.Frame(sel)
+        btn_frame.pack(side="bottom", fill="x", pady=10)
+        tk.Button(btn_frame, text="İptal", width=12, command=_cancel).pack(side="right", padx=10)
+        tk.Button(btn_frame, text="Aç", width=12, command=_confirm).pack(side="right")
+
+        sel.protocol("WM_DELETE_WINDOW", _cancel)
+        sel.transient(root)
+        sel.grab_set()
+        root.wait_window(sel)
+        root.destroy()
+
+        if not result["ok"]:
+            return None
+        return img_var.get(), lbl_var.get(), folder
+    except Exception as e:
+        print(f"[picker] tk picker failed: {e}")
+        return None
 
 
 def run_wizard():
@@ -487,7 +629,11 @@ def resolve_paths(args):
             print("[Compat] No CLI args; using script_dir/images and script_dir/labels.csv")
             images, labels, workspace = legacy_images, legacy_csv, script_dir
     if not images or not labels:
-        images, labels, workspace = run_wizard()
+        picked = _tk_pick_workspace()
+        if picked is not None:
+            images, labels, workspace = picked
+        else:
+            images, labels, workspace = run_wizard()
     if not workspace:
         workspace = os.path.dirname(os.path.abspath(labels)) \
             if os.path.isfile(labels) else os.path.abspath(labels)
@@ -502,6 +648,8 @@ class Reviewer:
     def __init__(self, paths, autosave_every=50):
         self.paths = paths
         self.autosave_every = autosave_every
+        self._switch_requested = False
+        self.toolbar_rects = []  # list of (x1, y1, x2, y2, action_name)
         os.makedirs(paths.trash_dir, exist_ok=True)
         if not os.path.exists(paths.csv_path):
             print("ERROR: " + paths.csv_path + " not found"); sys.exit(1)
@@ -752,6 +900,20 @@ class Reviewer:
 
     # ---------- mouse ----------
     def mouse_cb(self, event, x, y, flags, param):
+        # Toolbar buttons
+        if event == cv2.EVENT_LBUTTONDOWN:
+            for bx1, by1, bx2, by2, action in self.toolbar_rects:
+                if bx1 <= x <= bx2 and by1 <= y <= by2:
+                    if action == "save":
+                        self.save_csv()
+                        self.dirty = True
+                    elif action == "switch":
+                        self.save_csv()
+                        self._switch_requested = True
+                    elif action == "help":
+                        self.show_help_overlay = not self.show_help_overlay
+                        self.dirty = True
+                    return
         # Box list panel click -> select
         if event == cv2.EVENT_LBUTTONDOWN and self.box_list_panel_rect is not None:
             px1, py1, px2, py2 = self.box_list_panel_rect
@@ -1473,6 +1635,24 @@ class Reviewer:
                 ("  UNSAVED" if self.unsaved else ""))
         cv2.putText(canvas, info, (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.5, scol, 1, cv2.LINE_AA)
 
+        # Toolbar buttons (top-right)
+        self.toolbar_rects = []
+        buttons = [("SAVE", "save"), ("WORKSPACE", "switch"), ("HELP", "help")]
+        bx = DISPLAY_W - 10
+        by1, by2 = 8, 42
+        for label, action in buttons:
+            tw = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0][0]
+            bw = tw + 18
+            bx2 = bx
+            bx1 = bx - bw
+            fill = (60, 120, 60) if action == "save" else ((80, 80, 120) if action == "switch" else (80, 80, 80))
+            cv2.rectangle(canvas, (bx1, by1), (bx2, by2), fill, -1)
+            cv2.rectangle(canvas, (bx1, by1), (bx2, by2), (200, 200, 200), 1)
+            cv2.putText(canvas, label, (bx1 + 9, by2 - 11),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+            self.toolbar_rects.append((bx1, by1, bx2, by2, action))
+            bx = bx1 - 8
+
         # Mode bar
         cv2.rectangle(canvas, (0, DISPLAY_H - 30), (DISPLAY_W, DISPLAY_H), (30, 30, 30), -1)
         if self.batch_trash_mode:
@@ -1712,6 +1892,7 @@ class Reviewer:
             "[                  : toggle thumbnail strip (prev/next preview)",
             "Z                  : undo last trash or crop",
             "S / Q              : save / save and quit",
+            "Top-right buttons  : SAVE / WORKSPACE / HELP",
             "ESC                : cancel edit / draw / crop / class-pick mode",
             "",
             "After draw or class change:",
@@ -1734,6 +1915,8 @@ class Reviewer:
         while True:
             if len(self.frames) == 0:
                 print("No frames left"); break
+            if self._switch_requested:
+                break
             if self.dirty:
                 cv2.imshow(wname, self.render())
                 self.dirty = False
@@ -1903,11 +2086,23 @@ class Reviewer:
         print("\nSession: Pass=" + str(self.session_passed) +
               " Trash=" + str(self.session_trashed) +
               " Crop=" + str(self.session_cropped))
+        return self._switch_requested
 
 
 def main(argv=None):
     args = parse_args(argv if argv is not None else sys.argv[1:])
-    paths, source_labels = resolve_paths(args)
+    while True:
+        paths, source_labels = resolve_paths(args)
+        switched = _run_once(args, paths, source_labels)
+        if not switched:
+            break
+        # next iteration: clear args so picker opens for the new workspace
+        args.images = None
+        args.labels = None
+        args.workspace = None
+
+
+def _run_once(args, paths, source_labels):
     if not os.path.exists(paths.csv_path):
         if not os.path.exists(source_labels):
             print("ERROR: labels path not found: " + source_labels); sys.exit(1)
@@ -1923,12 +2118,12 @@ def main(argv=None):
     if getattr(args, "export_yolo", None):
         df_now = pd.read_csv(paths.csv_path)
         export_yolo(df_now, paths.images_dir, args.export_yolo)
-        return
+        return False
     if getattr(args, "export_coco", None):
         df_now = pd.read_csv(paths.csv_path)
         export_coco(df_now, paths.images_dir, args.export_coco)
-        return
-    Reviewer(paths, autosave_every=args.autosave).run()
+        return False
+    return bool(Reviewer(paths, autosave_every=args.autosave).run())
 
 
 if __name__ == "__main__":
